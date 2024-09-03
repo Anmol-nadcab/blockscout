@@ -122,7 +122,10 @@ defmodule Explorer.Mixfile do
       {:logger_json, "~> 5.1"},
       {:typed_ecto_schema, "~> 0.4.1", runtime: false},
       {:ueberauth, "~> 0.7"},
-      {:recon, "~> 2.5"}
+      {:ueberauth_auth0, "~> 2.0"},
+      {:recon, "~> 2.5"},
+      {:oauth2, "~> 2.0"},
+      {:siwe, github: "blockscout/siwe-ex"}
     ]
   end
 
