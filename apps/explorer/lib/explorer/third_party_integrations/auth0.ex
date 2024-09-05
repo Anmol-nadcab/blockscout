@@ -126,12 +126,19 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
 
   defp handle_identity(nil, email, ip), do: do_send_otp(email, ip)
 
-  defp handle_identity(%Identity{otp_sent_at: otp_sent_at}, email, ip) do
+  defp handle_identity(%Identity{otp_sent_at: otp_sent_at} = identity, email, ip) do
     otp_resend_interval = Application.get_env(:explorer, Account, :otp_resend_interval)
 
     case Helper.check_time_interval(otp_sent_at, otp_resend_interval) do
-      true -> do_send_otp(email, ip)
-      interval -> {:interval, interval}
+      true ->
+        identity
+        |> Identity.changeset(%{otp_sent_at: DateTime.utc_now()})
+        |> Repo.account_repo().update()
+
+        do_send_otp(email, ip)
+
+      interval ->
+        {:interval, interval}
     end
   end
 
@@ -310,8 +317,8 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
          {:signature, {:ok, %{nonce: ^nonce}}} <-
            {:signature, message |> String.trim() |> Siwe.parse_if_valid(signature)},
          Redix.command(:redix, ["DEL", cookie_key(address <> "siwe_nonce")]),
-         {:account, {:ok, []}} <- {:account, find_web3_users_by_address(address)},
-         {:ok, account} <- update_account_with_eth_address(user_id, address) do
+         {:account, {:ok, []}} <- {:account, find_users_by_web3_address(address)},
+         {:ok, account} <- update_account_with_web3_address(user_id, address) do
       {:ok, create_auth(account, "user_id")}
     else
       {:nonce, _} ->
@@ -334,22 +341,21 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
     end
   end
 
-  @spec get_auth_with_web3(String.t(), String.t(), String.t()) ::
-          :error | {:error, String.t()} | {:ok, Ueberauth.Auth.t()}
-  def get_auth_with_web3(address, message, signature) do
-    with {:nonce, {:ok, nonce}} <-
-           {:nonce, Redix.command(:redix, ["GET", cookie_key(address <> "siwe_nonce")])},
-         {:signature, {:ok, %{nonce: ^nonce}}} <-
+  @spec get_auth_with_web3(String.t(), String.t()) :: :error | {:error, String.t()} | {:ok, Ueberauth.Auth.t()}
+  def get_auth_with_web3(message, signature) do
+    with {:signature, {:ok, %{nonce: nonce, address: address}}} <-
            {:signature, message |> String.trim() |> Siwe.parse_if_valid(signature)},
+         {:nonce, {:ok, ^nonce}} <-
+           {:nonce, Redix.command(:redix, ["GET", cookie_key(address <> "siwe_nonce")])},
          {:account, {:ok, account}} <- {:account, find_or_create_web3_account(address, signature)} do
       Redix.command(:redix, ["DEL", cookie_key(address <> "siwe_nonce")])
       {:ok, create_auth(account, "user_id")}
     else
+      {:nonce, {:ok, _}} ->
+        {:error, "Wrong nonce in message"}
+
       {:nonce, _} ->
         {:error, "Request siwe message via /api/account/v2/siwe_message"}
-
-      {:signature, {:ok, _}} ->
-        {:error, "Wrong nonce in message"}
 
       {:signature, error} ->
         error
@@ -360,12 +366,12 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
   end
 
   defp find_or_create_web3_account(address, signature) do
-    case find_web3_users_by_address(address) do
-      {:ok, [%{"user_metadata" => %{"eth_address" => ^address}} = user]} ->
+    case find_users_by_web3_address(address) do
+      {:ok, [%{"user_metadata" => %{"web3_address_hash" => ^address}} = user]} ->
         {:ok, user}
 
       {:ok, [%{"user_id" => user_id}]} ->
-        update_account_with_eth_address(user_id, address)
+        update_account_with_web3_address(user_id, address)
 
       {:ok, []} ->
         create_web3_user(address, signature)
@@ -379,7 +385,7 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
     end
   end
 
-  defp find_web3_users_by_address(address) do
+  defp find_users_by_web3_address(address) do
     with token when is_binary(token) <- get_m2m_jwt(),
          client = OAuth.client(token: token),
          {:ok, %OAuth2.Response{status_code: 200, body: users}} when is_list(users) <-
@@ -389,7 +395,7 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
              [],
              params: %{
                "q" =>
-                 ~s(user_id:*siwe*#{address} OR user_id:*Passkey*#{address} OR user_metadata.eth_address:"#{address}")
+                 ~s(user_id:*siwe*#{address} OR user_id:*Passkey*#{address} OR user_metadata.web3_address_hash:"#{address}")
              }
            ) do
       {:ok, users}
@@ -411,10 +417,10 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
     end
   end
 
-  defp update_account_with_eth_address(user_id, address) do
+  defp update_account_with_web3_address(user_id, address) do
     with token when is_binary(token) <- get_m2m_jwt(),
          client = OAuth.client(token: token),
-         body = %{"user_metadata" => %{"eth_address" => address}},
+         body = %{"user_metadata" => %{"web3_address_hash" => address}},
          headers = [{"Content-type", "application/json"}],
          {:ok, %OAuth2.Response{status_code: 200, body: user}} <-
            Client.patch(client, "/api/v2/users/#{user_id}", body, headers) do
@@ -432,7 +438,7 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
            password: signature,
            email_verified: true,
            connection: :"Username-Password-Authentication",
-           user_metadata: %{eth_address: address}
+           user_metadata: %{web3_address_hash: address}
          },
          headers = [{"Content-type", "application/json"}],
          {:ok, %OAuth2.Response{status_code: 201, body: user}} <-

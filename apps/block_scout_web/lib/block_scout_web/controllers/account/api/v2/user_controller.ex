@@ -24,11 +24,11 @@ defmodule BlockScoutWeb.Account.Api.V2.UserController do
   @token_balances_amount 150
 
   def info(conn, _params) do
-    with {:auth, %{id: uid}} <- {:auth, current_user(conn)},
+    with {:auth, %{id: uid} = session} <- {:auth, current_user(conn)},
          {:identity, %Identity{} = identity} <- {:identity, Identity.find_identity(uid)} do
       conn
       |> put_status(200)
-      |> render(:user_info, %{identity: identity})
+      |> render(:user_info, %{identity: identity |> Identity.put_session_info(session)})
     end
   end
 

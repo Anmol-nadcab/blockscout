@@ -64,9 +64,8 @@ defmodule BlockScoutWeb.Account.Api.V2.AuthenticateController do
     end
   end
 
-  def authenticate_via_wallet(conn, %{"address" => address, "message" => message, "signature" => signature} = params) do
-    with {:format, {:ok, address_hash}} <- {:format, Chain.string_to_address_hash(address)},
-         {:ok, auth} <- Auth0.get_auth_with_web3(Address.checksum(address_hash), message, signature) do
+  def authenticate_via_wallet(conn, %{"message" => message, "signature" => signature} = params) do
+    with {:ok, auth} <- Auth0.get_auth_with_web3(message, signature) do
       put_auth_to_session(conn, params, auth)
     end
   end

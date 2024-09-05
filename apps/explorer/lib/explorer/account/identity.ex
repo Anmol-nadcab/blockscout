@@ -7,21 +7,24 @@ defmodule Explorer.Account.Identity do
   require Logger
   require Poison
 
+  alias BlockScoutWeb.Chain
   alias Explorer.Account.Api.Plan
   alias Explorer.Account.{TagAddress, Watchlist}
-  alias Explorer.Repo
+  alias Explorer.{Chain, Repo}
+
+  alias Explorer.Chain.{Address, Hash}
   alias Ueberauth.Auth
 
   typed_schema "account_identities" do
     field(:uid_hash, Cloak.Ecto.SHA256) :: binary() | nil
     field(:uid, Explorer.Encrypted.Binary, null: false)
     field(:email, Explorer.Encrypted.Binary, null: false)
-    field(:name, Explorer.Encrypted.Binary, null: false)
-    field(:nickname, Explorer.Encrypted.Binary)
+    field(:name, Explorer.Encrypted.Binary, virtual: true)
+    field(:nickname, Explorer.Encrypted.Binary, virtual: true)
+    field(:address_hash, Hash.Address, virtual: true)
     field(:avatar, Explorer.Encrypted.Binary)
     field(:verification_email_sent_at, :utc_datetime_usec)
     field(:otp_sent_at, :utc_datetime_usec)
-    field(:migrated_to_v2, :boolean)
 
     has_many(:tag_addresses, TagAddress)
     has_many(:watchlists, Watchlist)
@@ -43,6 +46,24 @@ defmodule Explorer.Account.Identity do
     # Using force_change instead of put_change due to https://github.com/danielberkompas/cloak_ecto/issues/53
     changeset
     |> force_change(:uid_hash, get_field(changeset, :uid))
+  end
+
+  def put_session_info(identity, %{name: name, nickname: nickname, address_hash: address_hash}) do
+    %__MODULE__{
+      identity
+      | name: session_info.name,
+        nickname: session_info.nickname,
+        address_hash: session_info.address_hash
+    }
+  end
+
+  def put_session_info(identity, %{name: name, nickname: nickname, address_hash: address_hash}) do
+    %__MODULE__{
+      identity
+      | name: session_info.name,
+        nickname: session_info.nickname,
+        address_hash: session_info.address_hash
+    }
   end
 
   def find_or_create(%Auth{} = auth) do
@@ -82,7 +103,8 @@ defmodule Explorer.Account.Identity do
       email: email_from_auth(auth),
       name: name_from_auth(auth),
       nickname: nickname_from_auth(auth),
-      avatar: avatar_from_auth(auth)
+      avatar: avatar_from_auth(auth),
+      address_hash: address_hash_from_auth(auth)
     }
   end
 
@@ -115,6 +137,7 @@ defmodule Explorer.Account.Identity do
       email: email_from_auth(auth),
       nickname: nickname_from_auth(auth),
       avatar: avatar_from_auth(auth),
+      address_hash: address_hash_from_auth(auth),
       email_verified: false
     }
   end
@@ -129,6 +152,7 @@ defmodule Explorer.Account.Identity do
       name: name_from_auth(auth),
       nickname: nickname_from_auth(auth),
       avatar: avatar_from_auth(auth),
+      address_hash: address_hash_from_auth(auth),
       watchlist_id: watchlist.id,
       email_verified: true
     }
@@ -139,7 +163,8 @@ defmodule Explorer.Account.Identity do
       email: email_from_auth(auth),
       name: name_from_auth(auth),
       nickname: nickname_from_auth(auth),
-      avatar: avatar_from_auth(auth)
+      avatar: avatar_from_auth(auth),
+      address_hash: address_hash_from_auth(auth)
     }
   end
 
@@ -172,6 +197,19 @@ defmodule Explorer.Account.Identity do
       ["", lastname, _] -> lastname
       [name, "", _] -> name
       [name, lastname, _] -> name <> " " <> lastname
+    end
+  end
+
+  defp address_hash_from_auth(%Auth{
+         extra: %Ueberauth.Auth.Extra{raw_info: %{user: %{"user_metadata" => %{"web3_address_hash" => address_hash}}}}
+       }) do
+    address_hash
+  end
+
+  defp address_hash_from_auth(%Auth{uid: uid}) do
+    case uid |> String.slice(-42..-1) |> Chain.string_to_address_hash() do
+      {:ok, address_hash} -> address_hash |> Address.checksum()
+      _ -> nil
     end
   end
 end
