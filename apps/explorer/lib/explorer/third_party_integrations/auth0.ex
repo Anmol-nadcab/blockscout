@@ -25,7 +25,7 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
   def get_m2m_jwt_inner({:ok, token}) when not is_nil(token), do: token
 
   def get_m2m_jwt_inner(_) do
-    config = Application.get_env(:ueberauth, Ueberauth.Strategy.Auth0.OAuth)
+    config = Application.get_env(:ueberauth, OAuth)
 
     body = %{
       "client_id" => config[:client_id],
@@ -70,25 +70,6 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
     token
   end
 
-  @spec link_email(String.t(), String.t(), String.t()) :: :error | {:ok, Auth.t()} | {:error, String.t()}
-  def link_email(primary_user_id, email, otp) do
-    case find_users_by_email(email) do
-      {:ok, []} ->
-        with {:ok, token} <- confirm_otp(email, otp),
-             {:ok, "email|" <> identity_id} <- get_user_id_from_token(token),
-             :ok <- link_users(primary_user_id, identity_id, "email"),
-             {:ok, user} <- update_user_email(primary_user_id, email) do
-          {:ok, create_auth(user)}
-        end
-
-      {:ok, users} when is_list(users) ->
-        {:error, "Account with this email already exists"}
-
-      error ->
-        error
-    end
-  end
-
   @spec send_otp_for_linking(String.t(), String.t()) :: :error | :ok | {:error, String.t()}
   def send_otp_for_linking(email, ip) do
     case find_users_by_email(email) do
@@ -117,17 +98,128 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
     end
   end
 
-  @spec update_session_with_address_hash(map()) :: map()
+  @spec link_email(String.t(), String.t(), String.t()) :: :error | {:ok, Auth.t()} | {:error, String.t()}
+  def link_email(primary_user_id, email, otp) do
+    case find_users_by_email(email) do
+      {:ok, []} ->
+        with {:ok, token} <- confirm_otp(email, otp),
+             {:ok, "email|" <> identity_id} <- get_user_id_from_token(token),
+             :ok <- link_users(primary_user_id, identity_id, "email"),
+             {:ok, user} <- update_user_email(primary_user_id, email) do
+          {:ok, create_auth(user)}
+        end
+
+      {:ok, users} when is_list(users) ->
+        {:error, "Account with this email already exists"}
+
+      error ->
+        error
+    end
+  end
+
+  @spec confirm_otp_and_get_auth(String.t(), String.t()) :: :error | {:error, String.t()} | {:ok, Auth.t()}
+  def confirm_otp_and_get_auth(email, otp) do
+    with {:ok, token} <- confirm_otp(email, otp),
+         {:ok, user_id} <- get_user_id_from_token(token),
+         {:ok, user} <- get_user_by_id(user_id) do
+      maybe_link_email_and_get_auth(user)
+    end
+  end
+
+  @spec update_session_with_address_hash(map()) :: {:old, map()} | {:new, map()}
   def update_session_with_address_hash(%{address_hash: _} = session), do: {:old, session}
 
   def update_session_with_address_hash(%{uid: user_id} = session) do
     case get_user_by_id(user_id) do
       {:ok, user} ->
-        {:new, %{session | address_hash: user |> create_auth() |> Identity.address_hash_from_auth()}}
+        {:new, Map.put(session, :address_hash, user |> create_auth() |> Identity.address_hash_from_auth())}
 
       error ->
         Logger.error("Error when updating session with address hash: #{inspect(error)}")
         {:old, session}
+    end
+  end
+
+  @spec generate_siwe_message(String.t()) :: {:ok, String.t()} | {:error, String.t()}
+  def generate_siwe_message(address) do
+    nonce = Siwe.generate_nonce()
+    cache_nonce_for_address(nonce, address)
+
+    {int_chain_id, _} = Integer.parse(Application.get_env(:block_scout_web, :chain_id))
+
+    message = %Siwe.Message{
+      domain: Application.get_env(:block_scout_web, BlockScoutWeb.Endpoint)[:url][:host],
+      address: address,
+      statement: "Sign in to Blockscout Account V2 via Ethereum account",
+      uri:
+        Application.get_env(:block_scout_web, BlockScoutWeb.Endpoint)[:url][:scheme] <>
+          "://" <> Application.get_env(:block_scout_web, BlockScoutWeb.Endpoint)[:url][:host],
+      version: "1",
+      chain_id: int_chain_id,
+      nonce: nonce,
+      issued_at: DateTime.utc_now() |> DateTime.to_iso8601(),
+      expiration_time: DateTime.utc_now() |> DateTime.add(300, :second) |> DateTime.to_iso8601()
+    }
+
+    case Siwe.to_str(message) do
+      {:ok, message} ->
+        {:ok, message}
+
+      {:error, error} ->
+        Logger.error(fn -> "Error while generating Siwe Message: #{inspect(error)}" end)
+        {:error, error}
+    end
+  end
+
+  @spec link_address(String.t(), String.t(), String.t()) :: :error | {:error, String.t()} | {:ok, Auth.t()}
+  def link_address(user_id, message, signature) do
+    with {:signature, {:ok, %{nonce: nonce, address: address}}} <-
+           {:signature, message |> String.trim() |> Siwe.parse_if_valid(signature)},
+         {:nonce, {:ok, ^nonce}} <-
+           {:nonce, Redix.command(:redix, ["GET", cookie_key(address <> "siwe_nonce")])},
+         Redix.command(:redix, ["DEL", cookie_key(address <> "siwe_nonce")]),
+         {:user, {:ok, []}} <- {:user, find_users_by_web3_address(address)},
+         {:ok, user} <- update_user_with_web3_address(user_id, address) do
+      {:ok, create_auth(user)}
+    else
+      {:nonce, {:ok, _}} ->
+        {:error, "Wrong nonce in message"}
+
+      {:nonce, _} ->
+        {:error, "Request siwe message via /api/account/v2/siwe_message"}
+
+      {:signature, error} ->
+        error
+
+      {:user, {:ok, _users}} ->
+        {:error, "Account with this address already exists"}
+
+      {:user, error} ->
+        error
+
+      other ->
+        other
+    end
+  end
+
+  @spec get_auth_with_web3(String.t(), String.t()) :: :error | {:error, String.t()} | {:ok, Auth.t()}
+  def get_auth_with_web3(message, signature) do
+    with {:signature, {:ok, %{nonce: nonce, address: address}}} <-
+           {:signature, message |> String.trim() |> Siwe.parse_if_valid(signature)},
+         {:nonce, {:ok, ^nonce}} <-
+           {:nonce, Redix.command(:redix, ["GET", cookie_key(address <> "siwe_nonce")])},
+         {:user, {:ok, user}} <- {:user, find_or_create_web3_user(address, signature)} do
+      Redix.command(:redix, ["DEL", cookie_key(address <> "siwe_nonce")])
+      {:ok, create_auth(user)}
+    else
+      {:nonce, {:ok, _}} ->
+        {:error, "Wrong nonce in message"}
+
+      {:nonce, _} ->
+        {:error, "Request siwe message via /api/account/v2/siwe_message"}
+
+      {_step, error} ->
+        error
     end
   end
 
@@ -157,35 +249,26 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
   end
 
   defp do_send_otp(email, ip) do
-    auth0_config = Application.get_env(:ueberauth, Ueberauth.Strategy.Auth0.OAuth)
+    client = OAuth.client()
 
-    body = %{
-      email: email,
-      connection: :email,
-      send: :code,
-      client_id: auth0_config[:client_id],
-      client_secret: auth0_config[:client_secret]
-    }
+    body =
+      %{
+        email: email,
+        connection: :email,
+        send: :code
+      }
+      |> put_client_id_and_secret()
 
     headers = ["Content-type": "application/json", "auth0-forwarded-for": ip]
 
-    case HTTPoison.post("https://" <> auth0_config[:domain] <> "/passwordless/start", Jason.encode!(body), headers) do
-      {:ok, %HTTPoison.Response{status_code: 200}} ->
+    case Client.post(client, "/passwordless/start", body, headers) do
+      {:ok, %OAuth2.Response{status_code: 200}} ->
         :ok
 
       other ->
         Logger.error(fn -> ["Error while sending otp: ", inspect(other)] end)
 
         :error
-    end
-  end
-
-  @spec confirm_otp_and_get_auth(String.t(), String.t()) :: :error | {:error, String.t()} | {:ok, Ueberauth.Auth.t()}
-  def confirm_otp_and_get_auth(email, otp) do
-    with {:ok, token} <- confirm_otp(email, otp),
-         {:ok, user_id} <- get_user_id_from_token(token),
-         {:ok, user} <- get_user_by_id(user_id) do
-      maybe_link_email_and_get_auth(user)
     end
   end
 
@@ -216,7 +299,7 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
         realm: :email,
         grant_type: :"http://auth0.com/oauth/grant-type/passwordless/otp"
       }
-      |> Map.merge(get_client_id_and_secret())
+      |> put_client_id_and_secret()
 
     headers = [{"Content-type", "application/json"}]
 
@@ -245,7 +328,7 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
     end
   end
 
-  def get_user_by_id(id) do
+  defp get_user_by_id(id) do
     case get_m2m_jwt() do
       token when is_binary(token) ->
         client = OAuth.client(token: token)
@@ -326,91 +409,9 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
     {:ok, create_auth(user)}
   end
 
-  @spec generate_siwe_message(String.t()) :: {:ok, String.t()} | {:error, String.t()}
-  def generate_siwe_message(address) do
-    nonce = Siwe.generate_nonce()
-    cache_nonce_for_address(nonce, address)
-
-    {int_chain_id, _} = Integer.parse(Application.get_env(:block_scout_web, :chain_id))
-
-    message = %Siwe.Message{
-      domain: Application.get_env(:block_scout_web, BlockScoutWeb.Endpoint)[:url][:host],
-      address: address,
-      statement: "Sign in to Blockscout Account V2 via Ethereum account",
-      uri:
-        Application.get_env(:block_scout_web, BlockScoutWeb.Endpoint)[:url][:scheme] <>
-          "://" <> Application.get_env(:block_scout_web, BlockScoutWeb.Endpoint)[:url][:host],
-      version: "1",
-      chain_id: int_chain_id,
-      nonce: nonce,
-      issued_at: DateTime.utc_now() |> DateTime.to_iso8601(),
-      expiration_time: DateTime.utc_now() |> DateTime.add(300, :second) |> DateTime.to_iso8601()
-    }
-
-    case Siwe.to_str(message) do
-      {:ok, message} ->
-        {:ok, message}
-
-      {:error, error} ->
-        Logger.error(fn -> "Error while generating Siwe Message: #{inspect(error)}" end)
-        {:error, error}
-    end
-  end
-
   defp cache_nonce_for_address(nonce, address) do
     Redix.command(:redix, ["SET", cookie_key(address <> "siwe_nonce"), nonce, "EX", 300])
     nonce
-  end
-
-  def link_address(user_id, address, message, signature) do
-    with {:nonce, {:ok, nonce}} <-
-           {:nonce, Redix.command(:redix, ["GET", cookie_key(address <> "siwe_nonce")])},
-         {:signature, {:ok, %{nonce: ^nonce}}} <-
-           {:signature, message |> String.trim() |> Siwe.parse_if_valid(signature)},
-         Redix.command(:redix, ["DEL", cookie_key(address <> "siwe_nonce")]),
-         {:user, {:ok, []}} <- {:user, find_users_by_web3_address(address)},
-         {:ok, user} <- update_user_with_web3_address(user_id, address) do
-      {:ok, create_auth(user)}
-    else
-      {:nonce, _} ->
-        {:error, "Request siwe message via /api/account/v2/siwe_message"}
-
-      {:signature, {:ok, _}} ->
-        {:error, "Wrong nonce in message"}
-
-      {:signature, error} ->
-        error
-
-      {:user, {:ok, _users}} ->
-        {:error, "Account with this address already exists"}
-
-      {:user, error} ->
-        error
-
-      other ->
-        other
-    end
-  end
-
-  @spec get_auth_with_web3(String.t(), String.t()) :: :error | {:error, String.t()} | {:ok, Ueberauth.Auth.t()}
-  def get_auth_with_web3(message, signature) do
-    with {:signature, {:ok, %{nonce: nonce, address: address}}} <-
-           {:signature, message |> String.trim() |> Siwe.parse_if_valid(signature)},
-         {:nonce, {:ok, ^nonce}} <-
-           {:nonce, Redix.command(:redix, ["GET", cookie_key(address <> "siwe_nonce")])},
-         {:user, {:ok, user}} <- {:user, find_or_create_web3_user(address, signature)} do
-      Redix.command(:redix, ["DEL", cookie_key(address <> "siwe_nonce")])
-      {:ok, create_auth(user)}
-    else
-      {:nonce, {:ok, _}} ->
-        {:error, "Wrong nonce in message"}
-
-      {:nonce, _} ->
-        {:error, "Request siwe message via /api/account/v2/siwe_message"}
-
-      {_step, error} ->
-        error
-    end
   end
 
   defp find_or_create_web3_user(address, signature) do
@@ -521,18 +522,21 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
       provider: :auth0,
       strategy: Auth0,
       info: Auth0.info(conn_stub),
-      credentials: %Ueberauth.Auth.Credentials{},
+      credentials: %Auth.Credentials{},
       extra: Auth0.extra(conn_stub)
     }
   end
 
-  defp get_client_id_and_secret do
-    auth0_config = Application.get_env(:ueberauth, Ueberauth.Strategy.Auth0.OAuth)
+  defp put_client_id_and_secret(map) do
+    auth0_config = Application.get_env(:ueberauth, OAuth)
 
-    %{
-      client_id: auth0_config[:client_id],
-      client_secret: auth0_config[:client_secret]
-    }
+    Map.merge(
+      map,
+      %{
+        client_id: auth0_config[:client_id],
+        client_secret: auth0_config[:client_secret]
+      }
+    )
   end
 
   defp handle_common_errors(error, error_msg) do

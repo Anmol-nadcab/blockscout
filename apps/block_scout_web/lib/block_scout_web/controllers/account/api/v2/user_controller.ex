@@ -39,10 +39,6 @@ defmodule BlockScoutWeb.Account.Api.V2.UserController do
           |> put_status(200)
           |> render(:user_info, %{identity: identity |> Identity.put_session_info(session)})
       end
-
-      conn
-      |> put_status(200)
-      |> render(:user_info, %{identity: identity |> Identity.put_session_info(session)})
     end
   end
 
