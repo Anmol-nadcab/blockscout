@@ -11,7 +11,6 @@ defmodule Explorer.Account.Identity do
   alias Explorer.Account.Api.Plan
   alias Explorer.Account.{TagAddress, Watchlist}
   alias Explorer.{Chain, Repo}
-
   alias Explorer.Chain.{Address, Hash}
   alias Ueberauth.Auth
 
@@ -51,18 +50,17 @@ defmodule Explorer.Account.Identity do
   def put_session_info(identity, %{name: name, nickname: nickname, address_hash: address_hash}) do
     %__MODULE__{
       identity
-      | name: session_info.name,
-        nickname: session_info.nickname,
-        address_hash: session_info.address_hash
+      | name: name,
+        nickname: nickname,
+        address_hash: address_hash
     }
   end
 
-  def put_session_info(identity, %{name: name, nickname: nickname, address_hash: address_hash}) do
+  def put_session_info(identity, %{name: name, nickname: nickname}) do
     %__MODULE__{
       identity
-      | name: session_info.name,
-        nickname: session_info.nickname,
-        address_hash: session_info.address_hash
+      | name: name,
+        nickname: nickname
     }
   end
 
@@ -200,13 +198,13 @@ defmodule Explorer.Account.Identity do
     end
   end
 
-  defp address_hash_from_auth(%Auth{
-         extra: %Ueberauth.Auth.Extra{raw_info: %{user: %{"user_metadata" => %{"web3_address_hash" => address_hash}}}}
-       }) do
+  def address_hash_from_auth(%Auth{
+        extra: %Ueberauth.Auth.Extra{raw_info: %{user: %{"user_metadata" => %{"web3_address_hash" => address_hash}}}}
+      }) do
     address_hash
   end
 
-  defp address_hash_from_auth(%Auth{uid: uid}) do
+  def address_hash_from_auth(%Auth{uid: uid}) do
     case uid |> String.slice(-42..-1) |> Chain.string_to_address_hash() do
       {:ok, address_hash} -> address_hash |> Address.checksum()
       _ -> nil

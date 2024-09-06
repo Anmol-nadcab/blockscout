@@ -1,4 +1,5 @@
 defmodule BlockScoutWeb.Account.Api.V2.UserController do
+  alias Explorer.ThirdPartyIntegrations.Auth0
   use BlockScoutWeb, :controller
 
   import BlockScoutWeb.Account.AuthController, only: [current_user: 1]
@@ -26,6 +27,19 @@ defmodule BlockScoutWeb.Account.Api.V2.UserController do
   def info(conn, _params) do
     with {:auth, %{id: uid} = session} <- {:auth, current_user(conn)},
          {:identity, %Identity{} = identity} <- {:identity, Identity.find_identity(uid)} do
+      case Auth0.update_session_with_address_hash(session) do
+        {:old, session} ->
+          conn
+          |> put_status(200)
+          |> render(:user_info, %{identity: identity |> Identity.put_session_info(session)})
+
+        {:new, session} ->
+          conn
+          |> put_session(:current_user, session)
+          |> put_status(200)
+          |> render(:user_info, %{identity: identity |> Identity.put_session_info(session)})
+      end
+
       conn
       |> put_status(200)
       |> render(:user_info, %{identity: identity |> Identity.put_session_info(session)})

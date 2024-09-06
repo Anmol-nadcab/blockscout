@@ -125,7 +125,8 @@ defmodule Explorer.Mixfile do
       {:ueberauth_auth0, "~> 2.0"},
       {:recon, "~> 2.5"},
       {:oauth2, "~> 2.0"},
-      {:siwe, github: "blockscout/siwe-ex"}
+      {:siwe, github: "blockscout/siwe-ex"},
+      {:joken, "~> 2.6"}
     ]
   end
 

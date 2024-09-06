@@ -5,7 +5,7 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
   require Logger
 
   alias Explorer.Account.Identity
-  alias Explorer.Helper
+  alias Explorer.{Helper, Repo}
   alias OAuth2.{AccessToken, Client}
   alias Ueberauth.Auth
   alias Ueberauth.Strategy.Auth0
@@ -72,13 +72,13 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
 
   @spec link_email(String.t(), String.t(), String.t()) :: :error | {:ok, Auth.t()} | {:error, String.t()}
   def link_email(primary_user_id, email, otp) do
-    case find_accounts_by_email(email) do
+    case find_users_by_email(email) do
       {:ok, []} ->
         with {:ok, token} <- confirm_otp(email, otp),
-             {:ok, %{"sub" => "email|" <> identity_id}} <- get_userinfo(OAuth.client(token: token)),
-             :ok <- link_accounts(primary_user_id, identity_id, "email"),
-             {:ok, user} <- update_account_email(primary_user_id, email) do
-          {:ok, create_auth(user, "user_id")}
+             {:ok, "email|" <> identity_id} <- get_user_id_from_token(token),
+             :ok <- link_users(primary_user_id, identity_id, "email"),
+             {:ok, user} <- update_user_email(primary_user_id, email) do
+          {:ok, create_auth(user)}
         end
 
       {:ok, users} when is_list(users) ->
@@ -91,7 +91,7 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
 
   @spec send_otp_for_linking(String.t(), String.t()) :: :error | :ok | {:error, String.t()}
   def send_otp_for_linking(email, ip) do
-    case find_accounts_by_email(email) do
+    case find_users_by_email(email) do
       {:ok, []} ->
         do_send_otp(email, ip)
 
@@ -105,7 +105,7 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
 
   @spec send_otp(String.t(), String.t()) :: :error | :ok | {:interval, integer()}
   def send_otp(email, ip) do
-    case find_accounts_by_email(email) do
+    case find_users_by_email(email) do
       {:ok, []} ->
         do_send_otp(email, ip)
 
@@ -117,9 +117,23 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
     end
   end
 
+  @spec update_session_with_address_hash(map()) :: map()
+  def update_session_with_address_hash(%{address_hash: _} = session), do: {:old, session}
+
+  def update_session_with_address_hash(%{uid: user_id} = session) do
+    case get_user_by_id(user_id) do
+      {:ok, user} ->
+        {:new, %{session | address_hash: user |> create_auth() |> Identity.address_hash_from_auth()}}
+
+      error ->
+        Logger.error("Error when updating session with address hash: #{inspect(error)}")
+        {:old, session}
+    end
+  end
+
   defp handle_existing_user(user, email, ip) do
     user
-    |> create_auth("user_id")
+    |> create_auth()
     |> Identity.find_identity()
     |> handle_identity(email, ip)
   end
@@ -169,9 +183,27 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
   @spec confirm_otp_and_get_auth(String.t(), String.t()) :: :error | {:error, String.t()} | {:ok, Ueberauth.Auth.t()}
   def confirm_otp_and_get_auth(email, otp) do
     with {:ok, token} <- confirm_otp(email, otp),
-         {:ok, user} <- get_userinfo(OAuth.client(token: token)) do
+         {:ok, user_id} <- get_user_id_from_token(token),
+         {:ok, user} <- get_user_by_id(user_id) do
       maybe_link_email_and_get_auth(user)
     end
+  end
+
+  defp get_user_id_from_token(%AccessToken{other_params: %{"id_token" => token}}) do
+    case Joken.peek_claims(token) do
+      {:ok, %{"sub" => user_id}} ->
+        {:ok, user_id}
+
+      error ->
+        Logger.error("Error while peeking claims from token: #{inspect(error)}")
+        :error
+    end
+  end
+
+  defp get_user_id_from_token(token) do
+    Logger.error("No id_token in token: #{inspect(Map.update(token, :access_token, "xxx", fn _ -> "xxx" end))}")
+
+    {:error, "Misconfiguration detected, please contact support."}
   end
 
   defp confirm_otp(email, otp) do
@@ -213,7 +245,26 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
     end
   end
 
-  defp find_accounts_by_email(email) do
+  def get_user_by_id(id) do
+    case get_m2m_jwt() do
+      token when is_binary(token) ->
+        client = OAuth.client(token: token)
+
+        case Client.get(client, "/api/v2/users/#{id}") do
+          {:ok, %OAuth2.Response{status_code: 200, body: %{"user_id" => ^id} = user}} ->
+            {:ok, user}
+
+          {:error, %OAuth2.Response{status_code: 404}} ->
+            {:error, "User not found"}
+
+          other ->
+            Logger.error(["Error while getting user by id: ", inspect(other)])
+            :error
+        end
+    end
+  end
+
+  defp find_users_by_email(email) do
     case get_m2m_jwt() do
       token when is_binary(token) ->
         client = OAuth.client(token: token)
@@ -237,7 +288,7 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
     end
   end
 
-  defp maybe_link_email_and_get_auth(%{"email" => email, "sub" => "email|" <> identity_id = user_id} = user) do
+  defp maybe_link_email_and_get_auth(%{"email" => email, "user_id" => "email|" <> identity_id = user_id} = user) do
     case get_m2m_jwt() do
       token when is_binary(token) ->
         client = OAuth.client(token: token)
@@ -246,11 +297,11 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
                params: %{"q" => ~s(email:"#{email}" AND NOT user_id:"#{user_id}")}
              ) do
           {:ok, %OAuth2.Response{status_code: 200, body: []}} ->
-            {:ok, create_auth(user, "sub")}
+            {:ok, create_auth(user)}
 
           {:ok, %OAuth2.Response{status_code: 200, body: [%{"user_id" => primary_user_id} = user]}} ->
-            link_accounts(primary_user_id, identity_id, "email")
-            {:ok, create_auth(user, "user_id")}
+            link_users(primary_user_id, identity_id, "email")
+            {:ok, create_auth(user)}
 
           {:ok, %OAuth2.Response{status_code: 200, body: users}} when is_list(users) and length(users) > 1 ->
             Logger.error(["Found multiple users with the same email: ", inspect(users)])
@@ -272,7 +323,7 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
   end
 
   defp maybe_link_email_and_get_auth(user) do
-    {:ok, create_auth(user, "sub")}
+    {:ok, create_auth(user)}
   end
 
   @spec generate_siwe_message(String.t()) :: {:ok, String.t()} | {:error, String.t()}
@@ -317,9 +368,9 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
          {:signature, {:ok, %{nonce: ^nonce}}} <-
            {:signature, message |> String.trim() |> Siwe.parse_if_valid(signature)},
          Redix.command(:redix, ["DEL", cookie_key(address <> "siwe_nonce")]),
-         {:account, {:ok, []}} <- {:account, find_users_by_web3_address(address)},
-         {:ok, account} <- update_account_with_web3_address(user_id, address) do
-      {:ok, create_auth(account, "user_id")}
+         {:user, {:ok, []}} <- {:user, find_users_by_web3_address(address)},
+         {:ok, user} <- update_user_with_web3_address(user_id, address) do
+      {:ok, create_auth(user)}
     else
       {:nonce, _} ->
         {:error, "Request siwe message via /api/account/v2/siwe_message"}
@@ -330,10 +381,10 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
       {:signature, error} ->
         error
 
-      {:account, {:ok, _accounts}} ->
+      {:user, {:ok, _users}} ->
         {:error, "Account with this address already exists"}
 
-      {:account, error} ->
+      {:user, error} ->
         error
 
       other ->
@@ -347,9 +398,9 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
            {:signature, message |> String.trim() |> Siwe.parse_if_valid(signature)},
          {:nonce, {:ok, ^nonce}} <-
            {:nonce, Redix.command(:redix, ["GET", cookie_key(address <> "siwe_nonce")])},
-         {:account, {:ok, account}} <- {:account, find_or_create_web3_account(address, signature)} do
+         {:user, {:ok, user}} <- {:user, find_or_create_web3_user(address, signature)} do
       Redix.command(:redix, ["DEL", cookie_key(address <> "siwe_nonce")])
-      {:ok, create_auth(account, "user_id")}
+      {:ok, create_auth(user)}
     else
       {:nonce, {:ok, _}} ->
         {:error, "Wrong nonce in message"}
@@ -357,21 +408,18 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
       {:nonce, _} ->
         {:error, "Request siwe message via /api/account/v2/siwe_message"}
 
-      {:signature, error} ->
-        error
-
-      {:account, error} ->
+      {_step, error} ->
         error
     end
   end
 
-  defp find_or_create_web3_account(address, signature) do
+  defp find_or_create_web3_user(address, signature) do
     case find_users_by_web3_address(address) do
       {:ok, [%{"user_metadata" => %{"web3_address_hash" => ^address}} = user]} ->
         {:ok, user}
 
       {:ok, [%{"user_id" => user_id}]} ->
-        update_account_with_web3_address(user_id, address)
+        update_user_with_web3_address(user_id, address)
 
       {:ok, []} ->
         create_web3_user(address, signature)
@@ -404,7 +452,7 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
     end
   end
 
-  defp update_account_email(user_id, email) do
+  defp update_user_email(user_id, email) do
     with token when is_binary(token) <- get_m2m_jwt(),
          client = OAuth.client(token: token),
          body = %{"email" => email, "email_verified" => true},
@@ -417,7 +465,7 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
     end
   end
 
-  defp update_account_with_web3_address(user_id, address) do
+  defp update_user_with_web3_address(user_id, address) do
     with token when is_binary(token) <- get_m2m_jwt(),
          client = OAuth.client(token: token),
          body = %{"user_metadata" => %{"web3_address_hash" => address}},
@@ -449,7 +497,7 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
     end
   end
 
-  defp link_accounts(primary_user_id, secondary_identity_id, provider) do
+  defp link_users(primary_user_id, secondary_identity_id, provider) do
     with token when is_binary(token) <- get_m2m_jwt(),
          client = OAuth.client(token: token),
          body = %{
@@ -465,26 +513,11 @@ defmodule Explorer.ThirdPartyIntegrations.Auth0 do
     end
   end
 
-  defp get_userinfo(client) do
-    case Client.get(client, "/userinfo") do
-      {:ok, %OAuth2.Response{status_code: 200, body: user}} ->
-        {:ok, user}
-
-      {:ok, %OAuth2.Response{status_code: 401, body: body}} ->
-        Logger.error(["Failed to get auth via /userinfo. Unauthorized: ", inspect(body)])
-        {:error, "Unauthorized"}
-
-      other ->
-        Logger.error(["Error while getting auth via /userinfo: ", inspect(other)])
-        :error
-    end
-  end
-
-  defp create_auth(user, uid_key) do
+  defp create_auth(user) do
     conn_stub = %{private: %{auth0_user: user, auth0_token: nil}}
 
     %Auth{
-      uid: user[uid_key],
+      uid: user["user_id"],
       provider: :auth0,
       strategy: Auth0,
       info: Auth0.info(conn_stub),
