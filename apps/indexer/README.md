@@ -142,7 +142,7 @@ mix test --exclude no_nethermind
 
 | Protocol  | URL                                |
 |:----------|:-----------------------------------|
-| HTTP      | `http://localhost:8545`  |
+| HTTP      | `http://0.0.0.0:12001`  |
 | WebSocket | `ws://localhost:8546`    |
 
 ### Geth

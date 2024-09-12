@@ -12,14 +12,14 @@ config :explorer,
     transport: EthereumJSONRPC.HTTP,
     transport_options: [
       http: EthereumJSONRPC.HTTP.HTTPoison,
-      url: System.get_env("ETHEREUM_JSONRPC_HTTP_URL") || "http://localhost:8545",
+      url: System.get_env("ETHEREUM_JSONRPC_HTTP_URL") || "http://0.0.0.0:12001",
       fallback_url: System.get_env("ETHEREUM_JSONRPC_FALLBACK_HTTP_URL"),
       fallback_trace_url: System.get_env("ETHEREUM_JSONRPC_FALLBACK_TRACE_URL"),
       fallback_eth_call_url: System.get_env("ETHEREUM_JSONRPC_FALLBACK_ETH_CALL_URL"),
       method_to_url: [
-        eth_call: ConfigHelper.eth_call_url("http://localhost:8545"),
-        eth_getBalance: System.get_env("ETHEREUM_JSONRPC_TRACE_URL") || "http://localhost:8545",
-        trace_replayTransaction: System.get_env("ETHEREUM_JSONRPC_TRACE_URL") || "http://localhost:8545"
+        eth_call: ConfigHelper.eth_call_url("http://0.0.0.0:12001"),
+        eth_getBalance: System.get_env("ETHEREUM_JSONRPC_TRACE_URL") || "http://0.0.0.0:12001",
+        trace_replayTransaction: System.get_env("ETHEREUM_JSONRPC_TRACE_URL") || "http://0.0.0.0:12001"
       ],
       http_options: [recv_timeout: timeout, timeout: timeout, hackney: hackney_opts]
     ],

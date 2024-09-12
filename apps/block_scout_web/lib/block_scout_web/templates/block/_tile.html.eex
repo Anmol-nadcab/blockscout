@@ -80,3 +80,7 @@
     </div>
   </div>
 </div>
+
+<script>
+console.log(@block.miner,"sdasdasdsad")
+</script>

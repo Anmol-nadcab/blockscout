@@ -431,7 +431,7 @@ if System.get_env("METADATA_CONTRACT") && System.get_env("VALIDATORS_CONTRACT") 
 
   config :explorer, Explorer.Validator.MetadataProcessor, enabled: !disable_indexer?
 else
-  config :explorer, Explorer.Validator.MetadataProcessor, enabled: false
+  config :explorer, Explorer.Validator.MetadataProcessor, enabled: true
 end
 
 config :explorer, Explorer.Chain.Block.Reward,
